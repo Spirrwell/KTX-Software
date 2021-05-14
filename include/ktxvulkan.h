@@ -29,6 +29,17 @@
 
 #include <ktx.h>
 
+/* VMA will try to include vulkan.h on its own if VULKAN_H_ is not defined */
+/* But libktx provides functions and definitions for Vulkan in its own header */
+#ifdef VULKAN_H_
+#include "vk_mem_alloc.h"
+#else
+#define VMA_STATIC_VULKAN_FUNCTIONS 0
+#define VULKAN_H_
+#include "vk_mem_alloc.h"
+#undef VULKAN_H_
+#endif
+
 #if 0
 /* Avoid Vulkan include file */
 #define VK_DEFINE_HANDLE(object) typedef struct object##_T* object;
@@ -69,6 +80,8 @@ typedef struct ktxVulkanTexture
                                     loader. */
     VkDeviceMemory deviceMemory; /*!< The memory allocated for the image on
                                   the Vulkan device. */
+    VmaAllocation imageAllocation; /*!< The allocation for the image
+								   if using VMA. */
     VkImageViewType viewType; /*!< ViewType corresponding to @p image. Reflects
                                    the dimensionality, cubeness and arrayness
                                    of the image. */
@@ -120,6 +133,8 @@ typedef struct ktxVulkanDeviceInfo {
     const VkAllocationCallbacks* pAllocator;
     /** Memory properties of the Vulkan physical device. */
     VkPhysicalDeviceMemoryProperties deviceMemoryProperties;
+
+    VmaAllocator vmaAllocator;
 } ktxVulkanDeviceInfo;
 
 KTX_API ktxVulkanDeviceInfo* KTX_APIENTRY

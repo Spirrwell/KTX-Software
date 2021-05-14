@@ -351,8 +351,8 @@ optimalTilingPadCallback(int miplevel, int face,
         ud->offset += faceLodSize;
     } else {
         // Must remove padding. Copy a row at a time.
-		ktx_uint32_t image, imageIterations;
-		ktx_int32_t row;
+        ktx_uint32_t image, imageIterations;
+        ktx_int32_t row;
         ktx_uint32_t paddedRowPitch;
 
         if (ud->numDimensions == 3)
@@ -625,6 +625,7 @@ ktxTexture_VkUploadEx(ktxTexture* This, ktxVulkanDeviceInfo* vdi,
     ktx_uint32_t             numImageLayers, numImageLevels;
     ktx_uint32_t elementSize = ktxTexture_GetElementSize(This);
     ktx_bool_t               canUseFasterPath;
+    ktx_bool_t               usingVMA;
 
     if (!vdi || !This || !vkTexture) {
         return KTX_INVALID_VALUE;
@@ -634,6 +635,8 @@ ktxTexture_VkUploadEx(ktxTexture* This, ktxVulkanDeviceInfo* vdi,
         /* Nothing to upload. */
         return KTX_INVALID_OPERATION;
     }
+
+    usingVMA = vdi->vmaAllocator ? KTX_TRUE : KTX_FALSE;
 
     /* _ktxCheckHeader should have caught this. */
     assert(This->numFaces == 6 ? This->numDimensions == 2 : VK_TRUE);
@@ -775,6 +778,8 @@ ktxTexture_VkUploadEx(ktxTexture* This, ktxVulkanDeviceInfo* vdi,
         // Create a host-visible staging buffer that contains the raw image data
         VkBuffer stagingBuffer;
         VkDeviceMemory stagingMemory;
+        VmaAllocation stagingAllocation;
+        VmaAllocationInfo stagingAllocInfo;
         VkBufferImageCopy* copyRegions;
         VkDeviceSize textureSize;
         VkBufferCreateInfo bufferCreateInfo = {
@@ -795,6 +800,7 @@ ktxTexture_VkUploadEx(ktxTexture* This, ktxVulkanDeviceInfo* vdi,
         ktx_uint8_t* pMappedStagingBuffer;
         ktx_uint32_t numCopyRegions;
         user_cbdata_optimal cbData;
+        ktx_size_t stagingAllocationSize;
 
 
         textureSize = ktxTexture_GetDataSizeUncompressed(This);
@@ -832,33 +838,53 @@ ktxTexture_VkUploadEx(ktxTexture* This, ktxVulkanDeviceInfo* vdi,
         bufferCreateInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
         bufferCreateInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-        VK_CHECK_RESULT(vkCreateBuffer(vdi->device, &bufferCreateInfo,
-                                       vdi->pAllocator, &stagingBuffer));
+        if (usingVMA)
+        {
+            VmaAllocationCreateInfo allocCreateInfo = {
+                .usage = VMA_MEMORY_USAGE_CPU_ONLY
+            };
 
-        // Get memory requirements for the staging buffer (alignment,
-        // memory type bits)
-        vkGetBufferMemoryRequirements(vdi->device, stagingBuffer, &memReqs);
+            vResult = vmaCreateBuffer(vdi->vmaAllocator, &bufferCreateInfo, &allocCreateInfo, &stagingBuffer, &stagingAllocation, &stagingAllocInfo);
 
-        memAllocInfo.allocationSize = memReqs.size;
-        // Get memory type index for a host visible buffer
-        memAllocInfo.memoryTypeIndex = ktxVulkanDeviceInfo_getMemoryType(
-                vdi,
-                memReqs.memoryTypeBits,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
-              | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
-        );
+            if (vResult != VK_SUCCESS) {
+                return KTX_OUT_OF_MEMORY;
+            }
 
-        vResult = vkAllocateMemory(vdi->device, &memAllocInfo,
-                                  vdi->pAllocator, &stagingMemory);
-        if (vResult != VK_SUCCESS) {
-            return KTX_OUT_OF_MEMORY;
+            VK_CHECK_RESULT(vmaMapMemory(vdi->vmaAllocator, stagingAllocation, (void **)&pMappedStagingBuffer));
+            stagingAllocationSize = (ktx_size_t)stagingAllocInfo.size;
         }
-        VK_CHECK_RESULT(vkBindBufferMemory(vdi->device, stagingBuffer,
-                                           stagingMemory, 0));
+        else
+        {
+            VK_CHECK_RESULT(vkCreateBuffer(vdi->device, &bufferCreateInfo,
+                                           vdi->pAllocator, &stagingBuffer));
 
-        VK_CHECK_RESULT(vkMapMemory(vdi->device, stagingMemory, 0,
-                                    memReqs.size, 0,
-                                    (void **)&pMappedStagingBuffer));
+            // Get memory requirements for the staging buffer (alignment,
+            // memory type bits)
+            vkGetBufferMemoryRequirements(vdi->device, stagingBuffer, &memReqs);
+
+            memAllocInfo.allocationSize = memReqs.size;
+            // Get memory type index for a host visible buffer
+            memAllocInfo.memoryTypeIndex = ktxVulkanDeviceInfo_getMemoryType(
+                    vdi,
+                    memReqs.memoryTypeBits,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                  | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+            );
+
+            vResult = vkAllocateMemory(vdi->device, &memAllocInfo,
+                                      vdi->pAllocator, &stagingMemory);
+            if (vResult != VK_SUCCESS) {
+                return KTX_OUT_OF_MEMORY;
+            }
+            VK_CHECK_RESULT(vkBindBufferMemory(vdi->device, stagingBuffer,
+                                               stagingMemory, 0));
+
+            VK_CHECK_RESULT(vkMapMemory(vdi->device, stagingMemory, 0,
+                                        memReqs.size, 0,
+                                        (void **)&pMappedStagingBuffer));
+
+            stagingAllocationSize = (ktx_size_t)memAllocInfo.allocationSize;
+        }
 
         cbData.offset = 0;
         cbData.region = copyRegions;
@@ -877,7 +903,7 @@ ktxTexture_VkUploadEx(ktxTexture* This, ktxVulkanDeviceInfo* vdi,
             if (This->pData) {
                 // Image data has already been loaded. Copy to staging
                 // buffer.
-                assert(This->dataSize <= memAllocInfo.allocationSize);
+                assert(This->dataSize <= stagingAllocationSize);
                 memcpy(pMappedStagingBuffer, This->pData, This->dataSize);
             } else {
                 /* Load the image data directly into the staging buffer. */
@@ -886,7 +912,7 @@ ktxTexture_VkUploadEx(ktxTexture* This, ktxVulkanDeviceInfo* vdi,
                  * when building for arm64. */
                 kResult = ktxTexture_LoadImageData(This,
                                       pMappedStagingBuffer,
-                                      (ktx_size_t)memAllocInfo.allocationSize);
+                                      stagingAllocationSize);
                 if (kResult != KTX_SUCCESS)
                     return kResult;
             }
@@ -915,7 +941,11 @@ ktxTexture_VkUploadEx(ktxTexture* This, ktxVulkanDeviceInfo* vdi,
             }
         }
 
-        vkUnmapMemory(vdi->device, stagingMemory);
+        if (usingVMA) {
+            vmaUnmapMemory(vdi->vmaAllocator, stagingAllocation);
+        } else {
+            vkUnmapMemory(vdi->device, stagingMemory);
+        }
 
         // Create optimal tiled target image
         imageCreateInfo.imageType = imageType;
@@ -933,21 +963,28 @@ ktxTexture_VkUploadEx(ktxTexture* This, ktxVulkanDeviceInfo* vdi,
         imageCreateInfo.extent.height = vkTexture->height;
         imageCreateInfo.extent.depth = vkTexture->depth;
 
-        VK_CHECK_RESULT(vkCreateImage(vdi->device, &imageCreateInfo,
+        if (usingVMA) {
+            VmaAllocationCreateInfo allocCreateInfo = {
+                .usage = VMA_MEMORY_USAGE_GPU_ONLY
+            };
+            VK_CHECK_RESULT(vmaCreateImage(vdi->vmaAllocator, &imageCreateInfo, &allocCreateInfo, &vkTexture->image, &vkTexture->imageAllocation, NULL));
+        } else {
+            VK_CHECK_RESULT(vkCreateImage(vdi->device, &imageCreateInfo,
                                       vdi->pAllocator, &vkTexture->image));
 
-        vkGetImageMemoryRequirements(vdi->device, vkTexture->image, &memReqs);
+            vkGetImageMemoryRequirements(vdi->device, vkTexture->image, &memReqs);
 
-        memAllocInfo.allocationSize = memReqs.size;
+            memAllocInfo.allocationSize = memReqs.size;
 
-        memAllocInfo.memoryTypeIndex = ktxVulkanDeviceInfo_getMemoryType(
-                                          vdi, memReqs.memoryTypeBits,
-                                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        VK_CHECK_RESULT(vkAllocateMemory(vdi->device, &memAllocInfo,
-                                         vdi->pAllocator,
-                                         &vkTexture->deviceMemory));
-        VK_CHECK_RESULT(vkBindImageMemory(vdi->device, vkTexture->image,
-                                          vkTexture->deviceMemory, 0));
+            memAllocInfo.memoryTypeIndex = ktxVulkanDeviceInfo_getMemoryType(
+                                              vdi, memReqs.memoryTypeBits,
+                                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            VK_CHECK_RESULT(vkAllocateMemory(vdi->device, &memAllocInfo,
+                                             vdi->pAllocator,
+                                             &vkTexture->deviceMemory));
+            VK_CHECK_RESULT(vkBindImageMemory(vdi->device, vkTexture->image,
+                                              vkTexture->deviceMemory, 0));
+        }
 
         subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         subresourceRange.baseMipLevel = 0;
@@ -1007,13 +1044,18 @@ ktxTexture_VkUploadEx(ktxTexture* This, ktxVulkanDeviceInfo* vdi,
         vkDestroyFence(vdi->device, copyFence, vdi->pAllocator);
 
         // Clean up staging resources
-        vkFreeMemory(vdi->device, stagingMemory, vdi->pAllocator);
-        vkDestroyBuffer(vdi->device, stagingBuffer, vdi->pAllocator);
+        if (usingVMA) {
+            vmaDestroyBuffer(vdi->vmaAllocator, stagingBuffer, stagingAllocation);
+        } else {
+            vkFreeMemory(vdi->device, stagingMemory, vdi->pAllocator);
+            vkDestroyBuffer(vdi->device, stagingBuffer, vdi->pAllocator);
+        }
     }
     else
     {
         VkImage mappableImage;
-        VkDeviceMemory mappableMemory;
+        VkDeviceMemory mappableMemory = VK_NULL_HANDLE;
+        VmaAllocation mappableAllocation = VK_NULL_HANDLE;
         VkFence nullFence = { VK_NULL_HANDLE };
         VkSubmitInfo submitInfo = {
             .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -1037,30 +1079,38 @@ ktxTexture_VkUploadEx(ktxTexture* This, ktxVulkanDeviceInfo* vdi,
         imageCreateInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageCreateInfo.initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED;
 
-        // Load mip map level 0 to linear tiling image
-        VK_CHECK_RESULT(vkCreateImage(vdi->device, &imageCreateInfo,
-                                      vdi->pAllocator, &mappableImage));
+        if (usingVMA) {
+            VmaAllocationCreateInfo allocCreateInfo = {
+                .usage = VMA_MEMORY_USAGE_CPU_ONLY
+            };
 
-        // Get memory requirements for this image
-        // like size and alignment
-        vkGetImageMemoryRequirements(vdi->device, mappableImage, &memReqs);
-        // Set memory allocation size to required memory size
-        memAllocInfo.allocationSize = memReqs.size;
+            VK_CHECK_RESULT(vmaCreateImage(vdi->vmaAllocator, &imageCreateInfo, &allocCreateInfo, &mappableImage, &mappableAllocation, NULL));
+        } else {
+            // Load mip map level 0 to linear tiling image
+            VK_CHECK_RESULT(vkCreateImage(vdi->device, &imageCreateInfo,
+                                          vdi->pAllocator, &mappableImage));
 
-        // Get memory type that can be mapped to host memory
-        memAllocInfo.memoryTypeIndex = ktxVulkanDeviceInfo_getMemoryType(
-                vdi,
-                memReqs.memoryTypeBits,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            // Get memory requirements for this image
+            // like size and alignment
+            vkGetImageMemoryRequirements(vdi->device, mappableImage, &memReqs);
+            // Set memory allocation size to required memory size
+            memAllocInfo.allocationSize = memReqs.size;
 
-        // Allocate host memory
-        vResult = vkAllocateMemory(vdi->device, &memAllocInfo, vdi->pAllocator,
-                                  &mappableMemory);
-        if (vResult != VK_SUCCESS) {
-            return KTX_OUT_OF_MEMORY;
+            // Get memory type that can be mapped to host memory
+            memAllocInfo.memoryTypeIndex = ktxVulkanDeviceInfo_getMemoryType(
+                    vdi,
+                    memReqs.memoryTypeBits,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+            // Allocate host memory
+            vResult = vkAllocateMemory(vdi->device, &memAllocInfo, vdi->pAllocator,
+                                      &mappableMemory);
+            if (vResult != VK_SUCCESS) {
+                return KTX_OUT_OF_MEMORY;
+            }
+            VK_CHECK_RESULT(vkBindImageMemory(vdi->device, mappableImage,
+                                              mappableMemory, 0));
         }
-        VK_CHECK_RESULT(vkBindImageMemory(vdi->device, mappableImage,
-                                          mappableMemory, 0));
 
         cbData.destImage = mappableImage;
         cbData.device = vdi->device;
@@ -1069,8 +1119,12 @@ ktxTexture_VkUploadEx(ktxTexture* This, ktxVulkanDeviceInfo* vdi,
                          linearTilingCallback : linearTilingPadCallback;
 
         // Map image memory
-        VK_CHECK_RESULT(vkMapMemory(vdi->device, mappableMemory, 0,
-                        memReqs.size, 0, (void **)&cbData.dest));
+        if (usingVMA) {
+            VK_CHECK_RESULT(vmaMapMemory(vdi->vmaAllocator, mappableAllocation, (void **)&cbData.dest));
+        } else {
+            VK_CHECK_RESULT(vkMapMemory(vdi->device, mappableMemory, 0,
+                            memReqs.size, 0, (void **)&cbData.dest));
+        }
 
         // Iterate over images to copy texture data into mapped image memory.
         if (ktxTexture_isActiveStream(This)) {
@@ -1084,11 +1138,16 @@ ktxTexture_VkUploadEx(ktxTexture* This, ktxVulkanDeviceInfo* vdi,
         }
         // XXX Check for possible errors
 
-        vkUnmapMemory(vdi->device, mappableMemory);
+        if (usingVMA) {
+            vmaUnmapMemory(vdi->vmaAllocator, mappableAllocation);
+        } else {
+            vkUnmapMemory(vdi->device, mappableMemory);
+        }
 
         // Linear tiled images can be directly used as textures.
         vkTexture->image = mappableImage;
         vkTexture->deviceMemory = mappableMemory;
+        vkTexture->imageAllocation = mappableAllocation;
 
         if (This->generateMipmaps) {
             generateMipmaps(vkTexture, vdi,

@@ -339,6 +339,7 @@ macro(commom_lib_settings lib write)
             lib/vk_funcs.c
             lib/vk_funcs.h
             lib/vkloader.c
+            lib/vk_mem_alloc.cpp
         )
         target_include_directories(
             ${lib}
