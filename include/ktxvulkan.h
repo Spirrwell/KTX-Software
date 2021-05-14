@@ -34,7 +34,11 @@
 #ifdef VULKAN_H_
 #include "vk_mem_alloc.h"
 #else
+
+#ifdef KTX_VMA_INCLUDE
 #define VMA_STATIC_VULKAN_FUNCTIONS 0
+#endif
+
 #define VULKAN_H_
 #include "vk_mem_alloc.h"
 #undef VULKAN_H_

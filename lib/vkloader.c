@@ -27,6 +27,8 @@
 #include <string.h>
 
 #include "vk_funcs.h"   // Must be included before ktxvulkan.h.
+
+#define KTX_VMA_INCLUDE
 #include "ktxvulkan.h"
 #include "ktxint.h"
 #include "unused.h"
